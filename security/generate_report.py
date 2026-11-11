@@ -7,8 +7,10 @@ Inputs (all optional - a missing file is shown as "not run"):
   .trivyignore           accepted risks
   nmap-app-report.xml    Nmap scan of the application port
   nmap-nodeports.gnmap   Nmap scan of the Kubernetes NodePort range
-Output:
-  security-report.html
+  zap-report.json        OWASP ZAP baseline scan (DAST)
+Outputs:
+  security-summary.html  short summary, used as the e-mail body
+  security-report.html   full report with all details (attached / archived)
 Uses only the Python standard library.
 """
 import html
@@ -19,6 +21,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 OUT = "security-report.html"
+SUMMARY_OUT = "security-summary.html"
 OK, WARN, FAIL, NA = "PASS", "WARNING", "FAIL", "NOT RUN"
 COLORS = {OK: "#1a7f37", WARN: "#9a6700", FAIL: "#cf222e", NA: "#57606a"}
 SEV_COLORS = {"CRITICAL": "#cf222e", "HIGH": "#bc4c00", "MEDIUM": "#9a6700", "LOW": "#57606a"}
@@ -192,12 +195,48 @@ def nmap_section():
     return status, summary, intro + np_body + body
 
 
+# ---------- OWASP ZAP ----------
+ZAP_RISK = {"3": "High", "2": "Medium", "1": "Low", "0": "Informational"}
+ZAP_COLORS = {"High": "#cf222e", "Medium": "#bc4c00", "Low": "#9a6700", "Informational": "#57606a"}
+
+
+def zap_section():
+    data = load_json("zap-report.json")
+    if data is None:
+        return NA, "Report not found (stage did not run).", "<p>The ZAP security smoke test did not run in this build.</p>"
+    alerts = []
+    for site in data.get("site", []) or []:
+        for a in site.get("alerts", []) or []:
+            alerts.append(a)
+    counts = {r: 0 for r in ZAP_RISK.values()}
+    for a in alerts:
+        counts[ZAP_RISK.get(str(a.get("riskcode")), "Informational")] += 1
+    status = WARN if (counts["High"] or counts["Medium"]) else OK
+    summary = (f'{counts["High"]} high, {counts["Medium"]} medium, {counts["Low"]} low, '
+               f'{counts["Informational"]} informational alerts (report-only).')
+    body = ("<p>OWASP ZAP crawls the <b>running</b> application and passively checks every response "
+            "(security headers, cookies, information leaks, vulnerable libraries). The stage is report-only: "
+            "findings are documented, not blocking. Full details are in <code>zap-report.html</code>.</p>")
+    if alerts:
+        order = {"3": 0, "2": 1, "1": 2, "0": 3}
+        alerts.sort(key=lambda a: order.get(str(a.get("riskcode")), 9))
+        rows = []
+        for a in alerts:
+            risk = ZAP_RISK.get(str(a.get("riskcode")), "Informational")
+            name = a.get("name") or a.get("alert")
+            rows.append([f'<span style="color:{ZAP_COLORS[risk]};font-weight:bold">{e(risk)}</span>',
+                         e(name), e(a.get("count") or len(a.get("instances", [])))])
+        body += table(["Risk", "Alert", "Occurrences"], rows)
+    return status, summary, body
+
+
 # ---------- Page ----------
 def main():
     checks = [
         ("Secrets in Git history", "Gitleaks", *gitleaks_section()),
         ("Container vulnerabilities", "Trivy", *trivy_section()),
         ("Network exposure &amp; HTTP security", "Nmap", *nmap_section()),
+        ("Running application (DAST)", "OWASP ZAP", *zap_section()),
     ]
     result = os.environ.get("BUILD_RESULT", "UNKNOWN")
     build = f'{e(os.environ.get("JOB_NAME", "local"))} #{e(os.environ.get("BUILD_NUMBER", "-"))}'
@@ -207,20 +246,30 @@ def main():
     summary_rows = [[f"<b>{name}</b>", e(tool), badge(st), e(sm)] for name, tool, st, sm, _ in checks]
     sections = "".join(f'<h2 style="border-bottom:1px solid #d0d7de;padding-bottom:4px">{name} ({e(tool)}) {badge(st)}</h2>{body}'
                        for name, tool, st, sm, body in checks)
-    page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Security report - {build}</title></head>
-<body style="font-family:Segoe UI,Arial,sans-serif;color:#1f2328;max-width:1000px;margin:auto;padding:16px">
-<h1 style="margin-bottom:4px">DevSecOps security report</h1>
+    header = f"""<h1 style="margin-bottom:4px">DevSecOps security report</h1>
 <p style="margin-top:0">Build <b>{build}</b> &middot; result: <b style="color:{res_color}">{e(result)}</b>
 &middot; {datetime.now().strftime("%Y-%m-%d %H:%M")}{f' &middot; <a href="{e(url)}console">console output</a>' if url else ''}</p>
 <h2>Summary</h2>
 {table(["Check", "Tool", "Status", "Details"], summary_rows)}
 <p style="font-size:12px;color:#57606a">PASS: no issue &middot; WARNING: issues to plan, not blocking &middot;
-FAIL: blocking issue &middot; NOT RUN: the stage did not run (an earlier stage failed).</p>
-{sections}
-</body></html>"""
+FAIL: blocking issue &middot; NOT RUN: the stage did not run (an earlier stage failed).</p>"""
+    style = 'font-family:Segoe UI,Arial,sans-serif;color:#1f2328;max-width:1000px;margin:auto;padding:16px'
+
+    full = f"""<!doctype html><html><head><meta charset="utf-8"><title>Security report - {build}</title></head>
+<body style="{style}">{header}{sections}</body></html>"""
     with open(OUT, "w", encoding="utf-8") as f:
-        f.write(page)
-    print(f"Wrote {OUT}")
+        f.write(full)
+
+    attachments = "".join(f"<li><code>{n}</code></li>" for n in
+                          ["security-report.html (full report, all details)", "zap-report.html (OWASP ZAP report)",
+                           "trivy-report.json", "gitleaks-report.json", "nmap-app-report.xml"])
+    summary = f"""<!doctype html><html><head><meta charset="utf-8"><title>Security summary - {build}</title></head>
+<body style="{style}">{header}
+<p><b>Detailed reports are attached</b> to this e-mail and archived in Jenkins with the build:</p>
+<ul style="font-size:13px">{attachments}</ul></body></html>"""
+    with open(SUMMARY_OUT, "w", encoding="utf-8") as f:
+        f.write(summary)
+    print(f"Wrote {OUT} and {SUMMARY_OUT}")
 
 
 if __name__ == "__main__":

@@ -194,20 +194,22 @@ pipeline {
         }
     }
 
-    // 13. Always runs, success or failure: build the readable security report, keep it, email it, clean up
+    // 13. Always runs, success or failure: build the security summary + full report, archive everything,
+    //     email the summary with all reports attached, clean up
     post {
         always {
             withEnv(["BUILD_RESULT=${currentBuild.currentResult}"]) {
                 sh 'python3 security/generate_report.py || true'
             }
-            archiveArtifacts artifacts: 'security-report.html, gitleaks-report.json, trivy-report.json, nmap-app-report.xml, nmap-nodeports.gnmap, zap-report.html, zap-report.json',
+            archiveArtifacts artifacts: 'security-summary.html, security-report.html, gitleaks-report.json, trivy-report.json, nmap-app-report.xml, nmap-nodeports.gnmap, zap-report.html, zap-report.json',
                              allowEmptyArchive: true
             emailext(
                 to: "${NOTIFY_EMAIL}",
                 subject: "[Jenkins] ${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                 mimeType: 'text/html',
-                body: '${FILE,path="security-report.html"}',
-                attachmentsPattern: 'security-report.html, zap-report.html'
+                // Body = short summary only; every detailed report is attached
+                body: '${FILE,path="security-summary.html"}',
+                attachmentsPattern: 'security-report.html, zap-report.html, trivy-report.json, gitleaks-report.json, nmap-app-report.xml'
             )
             sh 'docker image prune -f || true'
             sh 'docker builder prune -f --filter until=72h || true'
