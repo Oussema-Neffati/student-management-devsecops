@@ -1,14 +1,24 @@
 pipeline {
     agent any
 
+    // Keep only the last 10 builds and their files (disk space on the VM)
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+    }
+
     environment {
         IMAGE_NAME        = "oussemaneffati/student-management"
         KUBECONFIG        = "/var/lib/jenkins/.kube/config"
         NOTIFY_EMAIL      = "oussema.neffati@esprit.tn"   // who receives the build report
         ALLOWED_NODEPORTS = "30080"                       // ports allowed to be open outside the cluster (space-separated)
+        MAVEN_OPTS        = "-Xmx768m"                    // cap Maven memory (VM stability)
+        ZAP_IMAGE         = "ghcr.io/zaproxy/zaproxy:stable"
     }
 
     stages {
+
+        // ===================== PHASE 1 - DEVELOPMENT =====================
+
         // 1. Download the latest code from GitHub
         stage('Checkout') {
             steps {
@@ -27,27 +37,27 @@ pipeline {
             }
         }
 
-        // 3. Compile the Java code and package it as a .jar with Maven
-        stage('Build Application') {
-            steps {
-                sh 'mvn clean package -DskipTests'
-            }
-        }
-
-        // 4. SAST: SonarQube analyses the source code for bugs, code smells and security hotspots
-        stage('SonarQube Analysis') {
+        // 3. SAST: SonarQube analyses the SOURCE code before anything is built.
+        //    "compile" only produces the .class files Sonar needs to analyse Java; nothing is packaged.
+        stage('SonarQube Analysis (SAST)') {
             steps {
                 withSonarQubeEnv('SonarQube') {
                     withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
                         sh '''
-                            mvn sonar:sonar \
+                            mvn clean compile sonar:sonar \
                             -Dsonar.projectKey=student-management \
                             -Dsonar.projectName=student-management \
-                            -Dsonar.login=$SONAR_TOKEN \
-                            -DskipTests
+                            -Dsonar.login=$SONAR_TOKEN
                         '''
                     }
                 }
+            }
+        }
+
+        // 4. Build: compile and package the application as a .jar with Maven
+        stage('Build Application') {
+            steps {
+                sh 'mvn clean package -DskipTests'
             }
         }
 
@@ -60,7 +70,7 @@ pipeline {
             }
         }
 
-        // 6. COMMIT practice - Container Security: scan the image BEFORE it is published.
+        // 6. COMMIT practice - SCA + Container Security: scan the image BEFORE it is published.
         //    Report = HIGH + CRITICAL; gate = fail only on CRITICAL vulnerabilities that have a fix.
         stage('Container Scan (Trivy)') {
             steps {
@@ -89,7 +99,8 @@ pipeline {
             }
         }
 
-        // 8. Rolling update on Kubernetes: pods are replaced one by one, no downtime
+        // 8. Rolling update on Kubernetes: pods are replaced one by one, no downtime.
+        //    Secrets come from Kubernetes Secrets (never from the code).
         stage('Deploy to Kubernetes') {
             steps {
                 sh '''
@@ -99,7 +110,7 @@ pipeline {
             }
         }
 
-        // 9. Smoke test: the new version must answer on its health endpoint
+        // 9. Verification: the new version must answer on its health endpoint
         stage('Verification') {
             steps {
                 sh '''
@@ -111,7 +122,9 @@ pipeline {
             }
         }
 
-        // 10. Network security: scan the DEPLOYED app from the network, like an attacker would.
+        // ===================== PHASE 2 - ACCEPTANCE =====================
+
+        // 10. Security scanning (Nmap): scan the DEPLOYED app from the network, like an attacker.
         //     Report = HTTP security headers, accepted methods, page title.
         //     Gate   = fail if a NodePort outside the allowlist is open.
         stage('Network Scan (Nmap)') {
@@ -139,7 +152,35 @@ pipeline {
             }
         }
 
-        // 11. Start Prometheus/Grafana if paused, and register the app as a metrics target
+        // ===================== PHASE 3 - PRODUCTION =====================
+
+        // 11. Security smoke test (OWASP ZAP Baseline Scan = DAST): ZAP crawls the running app
+        //     and passively checks every response (headers, cookies, information leaks...).
+        //     Report-only: findings are documented, not blocking (-I = do not fail on warnings).
+        stage('Security Smoke Test (ZAP Baseline)') {
+            steps {
+                sh '''
+                    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+                    mkdir -p zap && chmod 777 zap
+
+                    docker run --rm --network host \
+                      -v "$(pwd)/zap:/zap/wrk:rw" \
+                      ${ZAP_IMAGE} zap-baseline.py \
+                        -t "http://$NODE_IP:30080/student/swagger-ui/index.html" \
+                        -m 1 -I \
+                        -r zap-report.html -J zap-report.json || true
+
+                    # The stage must have produced its report, otherwise ZAP itself failed
+                    test -f zap/zap-report.html
+                    cp zap/zap-report.html zap/zap-report.json .
+                '''
+            }
+        }
+
+        // ===================== PHASE 4 - OPERATIONS =====================
+
+        // 12. Continuous monitoring: start Prometheus/Grafana if paused,
+        //     and register the app as a metrics target
         stage('Monitoring') {
             steps {
                 sh '''
@@ -153,21 +194,23 @@ pipeline {
         }
     }
 
-    // 12. Always runs, success or failure: build the readable security report, keep it, email it
+    // 13. Always runs, success or failure: build the readable security report, keep it, email it, clean up
     post {
         always {
             withEnv(["BUILD_RESULT=${currentBuild.currentResult}"]) {
                 sh 'python3 security/generate_report.py || true'
             }
-            archiveArtifacts artifacts: 'security-report.html, gitleaks-report.json, trivy-report.json, nmap-app-report.xml, nmap-nodeports.gnmap',
+            archiveArtifacts artifacts: 'security-report.html, gitleaks-report.json, trivy-report.json, nmap-app-report.xml, nmap-nodeports.gnmap, zap-report.html, zap-report.json',
                              allowEmptyArchive: true
             emailext(
                 to: "${NOTIFY_EMAIL}",
                 subject: "[Jenkins] ${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                 mimeType: 'text/html',
                 body: '${FILE,path="security-report.html"}',
-                attachmentsPattern: 'security-report.html'
+                attachmentsPattern: 'security-report.html, zap-report.html'
             )
+            sh 'docker image prune -f || true'
+            sh 'docker builder prune -f --filter until=72h || true'
         }
     }
 }
